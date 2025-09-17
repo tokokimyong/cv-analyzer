@@ -3,121 +3,149 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 import re
-import io
-from functools import reduce
+from io import BytesIO
 
-st.title("⚡ Cyclic Voltammetry Analyzer")
+st.title("CV Analyzer — Flexible (treatment or concentration)")
 
-uploaded_files = st.file_uploader(
-    "Upload file CV (.txt)", type=["txt"], accept_multiple_files=True
-)
+uploaded_files = st.file_uploader("Upload CV .txt files", accept_multiple_files=True, type=["txt"])
 
-data_dict = {}
+if not uploaded_files:
+    st.info("Upload minimal 1 file .txt (format: t, E, I).")
+    st.stop()
 
-if uploaded_files:
-    fig, ax = plt.subplots()
+# read all files
+data = {}
+filenames = []
+for f in uploaded_files:
+    label = f.name.rsplit(".",1)[0]
+    filenames.append(label)
+    df = pd.read_csv(f, header=None, names=["t","E","I"])
+    data[label] = df
 
-    for file in uploaded_files:
-        # Baca data
-        df = pd.read_csv(file, delim_whitespace=True, header=None)
-        df = df.rename(columns={1: "E", 2: "I"})[["E", "I"]]
-        df["E"] = pd.to_numeric(df["E"], errors="coerce")
-        df["I"] = pd.to_numeric(df["I"], errors="coerce")
-        df = df.dropna(subset=["E", "I"])
-        data_dict[file.name] = df
+# Option: use filename as label (always true) and optional auto-extract concentration
+st.sidebar.header("Options")
+use_filename_labels = st.sidebar.checkbox("Gunakan nama file sebagai label (default)", value=True)
+enable_autoconc = st.sidebar.checkbox("Coba ekstrak konsentrasi dari nama file (xxmm)", value=True)
+enable_calibration = st.sidebar.checkbox("Buat kurva kalibrasi? (harus isi konsentrasi)", value=False)
 
-        ax.plot(df["E"], df["I"], label=file.name)
+# Try auto-extract concentrations
+concs_auto = {}
+if enable_autoconc:
+    for label in filenames:
+        m = re.search(r'(\d+(\.\d+)?)\s*mm', label.lower())
+        if m:
+            concs_auto[label] = float(m.group(1))
 
-    ax.set_xlabel("Potential (V)")
-    ax.set_ylabel("Current (µA)")
-    ax.grid(True)
-    ax.legend()
-    st.pyplot(fig)
+# Show UI to input manual concentrations (only when calibration requested)
+concs_manual = {}
+if enable_calibration:
+    st.subheader("Masukkan konsentrasi (mM) untuk file yang ingin dipakai kalibrasi")
+    for label in filenames:
+        default_val = concs_auto.get(label, "")
+        inp = st.text_input(f"Konsentrasi untuk {label} (kosong = tidak ikut kalibrasi)", value=str(default_val), key="c_"+label)
+        if inp.strip() != "":
+            try:
+                concs_manual[label] = float(inp)
+            except:
+                st.error(f"Nilai untuk {label} bukan angka valid")
 
-    # -----------------------------
-    # Kurva kalibrasi (ambil puncak oksidasi & reduksi)
-    # -----------------------------
-    concentrations = []
-    ox_peaks = []
-    red_peaks = []
+# --- Overlay plot (always)
+st.subheader("Overlay CV")
+fig, ax = plt.subplots(figsize=(7,5))
+for label, df in data.items():
+    ax.plot(df["E"], df["I"], label=label)
+ax.set_xlabel("E (V)"); ax.set_ylabel("I (µA)")
+ax.legend(); ax.grid(True)
+st.pyplot(fig)
 
-    for name, df in data_dict.items():
-        # Ambil angka konsentrasi dari nama file (misal "10mm")
-        match = re.search(r"(\d+)\s*mm", name, re.IGNORECASE)
-        if match:
-            conc = float(match.group(1))
-            concentrations.append(conc)
+# --- Calibration (only if requested and at least 2 concs provided)
+if enable_calibration:
+    if len(concs_manual) < 2:
+        st.warning("Perlu minimal 2 file dengan konsentrasi untuk membuat kurva kalibrasi.")
+    else:
+        # prepare arrays
+        concs = []
+        ox_peaks = []
+        red_peaks = []
+        # windows (adjustable or hardcode as before)
+        ox_window = (0.37, 0.47)
+        red_window = (0.0, 0.1)
+        for label, conc in concs_manual.items():
+            df = data[label]
+            concs.append(conc)
+            ox_df = df[(df["E"]>ox_window[0]) & (df["E"]<ox_window[1])]
+            red_df = df[(df["E"]>red_window[0]) & (df["E"]<red_window[1])]
+            ox_peaks.append(ox_df["I"].max())
+            red_peaks.append(red_df["I"].min())
 
-            # Cari puncak oksidasi (positif, sekitar 0.42V)
-            ox_region = df[(df["E"] > 0.3) & (df["E"] < 0.6)]
-            ox_peak = ox_region["I"].max() if not ox_region.empty else np.nan
-            ox_peaks.append(ox_peak)
+        # sort by concentration
+        order = np.argsort(concs)
+        concs = np.array(concs)[order]
+        ox_peaks = np.array(ox_peaks)[order]
+        red_peaks = np.array(red_peaks)[order]
 
-            # Cari puncak reduksi (negatif, sekitar 0.05V)
-            red_region = df[(df["E"] > -0.1) & (df["E"] < 0.2)]
-            red_peak = red_region["I"].min() if not red_region.empty else np.nan
-            red_peaks.append(red_peak)
+        # linear fit oxidation
+        m_ox, b_ox = np.polyfit(concs, ox_peaks, 1)
+        r2_ox = np.corrcoef(concs, ox_peaks)[0,1]**2
 
-    if concentrations:
-        # Dataframe kalibrasi
+        st.subheader("Kalibrasi Oksidasi")
+        fig2, ax2 = plt.subplots()
+        ax2.scatter(concs, ox_peaks, color="red")
+        ax2.plot(concs, m_ox*concs+b_ox, "r--")
+        ax2.set_xlabel("Concentration (mM)"); ax2.set_ylabel("Peak I (µA)")
+        ax2.set_title(f"I = {m_ox:.3f} C + {b_ox:.3f}, R2={r2_ox:.3f}")
+        st.pyplot(fig2)
+
+        # linear fit reduction
+        m_red, b_red = np.polyfit(concs, red_peaks, 1)
+        r2_red = np.corrcoef(concs, red_peaks)[0,1]**2
+
+        st.subheader("Kalibrasi Reduksi")
+        fig3, ax3 = plt.subplots()
+        ax3.scatter(concs, red_peaks, color="blue")
+        ax3.plot(concs, m_red*concs+b_red, "b--")
+        ax3.set_xlabel("Concentration (mM)"); ax3.set_ylabel("Peak I (µA)")
+        ax3.set_title(f"I = {m_red:.3f} C + {b_red:.3f}, R2={r2_red:.3f}")
+        st.pyplot(fig3)
+
+        # offer excel download
+        compiled_df = pd.DataFrame({"Concentration (mM)": concs, "Ox Peak": ox_peaks, "Red Peak": red_peaks})
+        buffer = BytesIO()
+        with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+            compiled_df.to_excel(writer, index=False, sheet_name="Calibration")
+        buffer.seek(0)
+        st.download_button("Download calibration Excel", data=buffer, file_name="calibration.xlsx")
+
+# --- Export to Excel ---
+st.subheader("Export Data to Excel")
+compiled_df = pd.DataFrame({"E (V)": list(data.values())[0]["E"]})
+for label, df in data.items():
+    compiled_df[f"I {label}"] = df["I"].values
+
+buffer = BytesIO()
+with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+    compiled_df.to_excel(writer, sheet_name="E vs I", index=False)
+
+    # sheet kalibrasi hanya kalau datanya ada
+    if enable_calibration and len(concs) > 1:
         calib_df = pd.DataFrame({
-            "Concentration (mM)": concentrations,
+            "Concentration (mM)": concs,
             "Oxidation Peak (µA)": ox_peaks,
             "Reduction Peak (µA)": red_peaks
         })
+        calib_df.to_excel(writer, sheet_name="Calibration Data", index=False)
 
-        st.subheader("📈 Calibration Curves")
+        eq_df = pd.DataFrame({
+            "Type": ["Oxidation", "Reduction"],
+            "Slope (m)": [m_ox, m_red],
+            "Intercept (b)": [b_ox, b_red],
+            "R²": [r2_ox, r2_red]
+        })
+        eq_df.to_excel(writer, sheet_name="Regression Equations", index=False)
 
-        # Oksidasi
-        fig_ox, ax_ox = plt.subplots()
-        ax_ox.scatter(concentrations, ox_peaks, color="red", label="Oxidation")
-        m, b = np.polyfit(concentrations, ox_peaks, 1)
-        ax_ox.plot(concentrations, m*np.array(concentrations)+b, "--", color="black")
-        ax_ox.set_xlabel("Concentration (mM)")
-        ax_ox.set_ylabel("Oxidation Peak (µA)")
-        ax_ox.legend()
-        st.pyplot(fig_ox)
-
-        # Reduksi
-        fig_red, ax_red = plt.subplots()
-        ax_red.scatter(concentrations, red_peaks, color="blue", label="Reduction")
-        m, b = np.polyfit(concentrations, red_peaks, 1)
-        ax_red.plot(concentrations, m*np.array(concentrations)+b, "--", color="black")
-        ax_red.set_xlabel("Concentration (mM)")
-        ax_red.set_ylabel("Reduction Peak (µA)")
-        ax_red.legend()
-        st.pyplot(fig_red)
-
-        # Tombol download kalibrasi
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-            calib_df.to_excel(writer, sheet_name="Calibration", index=False)
-        st.download_button(
-            "📥 Download Calibration Data (Excel)",
-            buffer.getvalue(),
-            file_name="calibration_data.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-    # -----------------------------
-    # Overlay data mentah (gabung 1 sheet)
-    # -----------------------------
-    if data_dict:
-        merged = []
-        for name, df in data_dict.items():
-            df_renamed = df.rename(columns={"I": f"I_{name}"})
-            merged.append(df_renamed)
-
-        df_merged = reduce(lambda left, right: pd.merge(left, right, on="E", how="outer"), merged)
-        df_merged = df_merged.sort_values(by="E")
-
-        buffer2 = io.BytesIO()
-        with pd.ExcelWriter(buffer2, engine="xlsxwriter") as writer:
-            df_merged.to_excel(writer, sheet_name="Overlay", index=False)
-
-        st.download_button(
-            "📥 Download Overlay Data (Excel, 1 Sheet)",
-            buffer2.getvalue(),
-            file_name="overlay_data.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+st.download_button(
+    label="Download Excel File",
+    data=buffer,
+    file_name="cv_analysis.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
