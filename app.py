@@ -21,6 +21,9 @@ if uploaded_files:
         # Baca data
         df = pd.read_csv(file, delim_whitespace=True, header=None)
         df = df.rename(columns={1: "E", 2: "I"})[["E", "I"]]
+        df["E"] = pd.to_numeric(df["E"], errors="coerce")
+        df["I"] = pd.to_numeric(df["I"], errors="coerce")
+        df = df.dropna(subset=["E", "I"])
         data_dict[file.name] = df
 
         ax.plot(df["E"], df["I"], label=file.name)
